@@ -1,0 +1,253 @@
+name: دانلود یوتیوب 480p و انتقال به گیت‌هاب
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: "لینک ویدئوی YouTube"
+        required: true
+        type: string
+
+      zip_password:
+        description: "رمز عبور برای فایل فشرده"
+        required: true
+        type: string
+
+      delete_old_archives:
+        description: "پاک کردن فایل‌های قبلی آرشیو قبل از ساخت آرشیو جدید"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  download-youtube-480p:
+    runs-on: ubuntu-latest
+
+    env:
+      YOUTUBE_URL: ${{ github.event.inputs.youtube_url }}
+      ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Clean old archives if requested
+        if: ${{ github.event.inputs.delete_old_archives == 'true' }}
+        run: |
+          set -euo pipefail
+
+          echo "حذف فایل‌های قدیمی آرشیو درخواست شد."
+
+          find . -maxdepth 1 -type f -name "*.7z.*" -exec rm -v {} \;
+          find . -maxdepth 1 -type f -name "*.7z" -exec rm -v {} \;
+
+          git rm -f --ignore-unmatch "*.7z.*" "*.7z" || true
+
+          echo "فایل‌های قدیمی آرشیو پاک شدند."
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            ffmpeg \
+            p7zip-full \
+            python3-pip
+
+          python3 -m pip install --upgrade --user yt-dlp
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Validate YouTube URL
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${YOUTUBE_URL}" ]]; then
+            echo "YouTube URL is empty."
+            exit 1
+          fi
+
+          if [[ ! "${YOUTUBE_URL}" =~ ^https?:// ]]; then
+            echo "Invalid URL. URL must start with http:// or https://"
+            exit 1
+          fi
+
+          echo "URL validation passed."
+
+      - name: Download YouTube video in 480p
+        id: download_video
+        run: |
+          set -euo pipefail
+
+          mkdir -p downloads
+
+          # Best video up to 480p + best audio.
+          # Fallbacks:
+          #   1. Best combined format up to 480p.
+          #   2. Worst available video if no <=480p format exists.
+          FORMAT_SELECTOR="bv*[height<=480]+ba/b[height<=480]/wv*+ba/w"
+
+          yt-dlp \
+            --no-playlist \
+            --newline \
+            --restrict-filenames \
+            --windows-filenames \
+            --merge-output-format mp4 \
+            -f "${FORMAT_SELECTOR}" \
+            -o "downloads/%(title).180B_%(id)s.%(ext)s" \
+            --print after_move:filepath \
+            -- "${YOUTUBE_URL}" | tee yt-dlp-output.txt
+
+          DOWNLOADED_FILE="$(tail -n 1 yt-dlp-output.txt | tr -d '\r')"
+
+          if [[ ! -f "${DOWNLOADED_FILE}" ]]; then
+            echo "Could not detect downloaded file from yt-dlp output."
+            echo "Available files:"
+            find downloads -type f -maxdepth 1 -print
+            exit 1
+          fi
+
+          echo "Downloaded file: ${DOWNLOADED_FILE}"
+          echo "File size: $(ls -lh "${DOWNLOADED_FILE}" | awk '{print $5}')"
+
+          echo "downloaded_file=${DOWNLOADED_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare archive name
+        id: prepare_archive
+        run: |
+          set -euo pipefail
+
+          DOWNLOADED_FILE="${{ steps.download_video.outputs.downloaded_file }}"
+          BASENAME="$(basename "${DOWNLOADED_FILE}")"
+
+          FILE_BASE="${BASENAME%.*}"
+          FILE_EXT="${BASENAME##*.}"
+
+          if [[ "${FILE_BASE}" == "${BASENAME}" ]]; then
+            FILE_EXT=""
+          fi
+
+          ARCHIVE_PREFIX="sci-hub.ir_"
+          SAFE_BASE="$(echo "${FILE_BASE}" | sed 's/[^A-Za-z0-9._-]/_/g')"
+
+          MAX_TOTAL_LEN=60
+          FULL_ARCHIVE_NAME="${ARCHIVE_PREFIX}${SAFE_BASE}"
+
+          if [[ ${#FULL_ARCHIVE_NAME} -gt ${MAX_TOTAL_LEN} ]]; then
+            BASE_LEN_TO_KEEP=$((MAX_TOTAL_LEN - ${#ARCHIVE_PREFIX}))
+            if [[ ${BASE_LEN_TO_KEEP} -lt 1 ]]; then
+              BASE_LEN_TO_KEEP=1
+            fi
+            SAFE_BASE="$(echo "${SAFE_BASE}" | cut -c 1-${BASE_LEN_TO_KEEP})"
+            FULL_ARCHIVE_NAME="${ARCHIVE_PREFIX}${SAFE_BASE}"
+          fi
+
+          echo "archive_base_name=${FULL_ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "original_file=${DOWNLOADED_FILE}" >> "$GITHUB_OUTPUT"
+
+          echo "Archive base name: ${FULL_ARCHIVE_NAME}"
+
+      - name: Generate timestamp
+        id: timestamp
+        run: |
+          set -euo pipefail
+          echo "value=$(date -u +%Y%m%d_%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: Create encrypted split archive
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_FILE="${{ steps.prepare_archive.outputs.original_file }}"
+          ARCHIVE_NAME_PREFIX="${{ steps.prepare_archive.outputs.archive_base_name }}_${{ steps.timestamp.outputs.value }}"
+
+          if [[ ! -f "${ORIGINAL_FILE}" ]]; then
+            echo "Original downloaded file does not exist: ${ORIGINAL_FILE}"
+            exit 1
+          fi
+
+          # Split archive into 85 MB parts to stay below GitHub's 100 MB file limit.
+          # -p      : password
+          # -mhe=on : encrypt archive headers / file names
+          # -mx=3   : balanced compression speed
+          # -v85m   : split size
+          7z a \
+            -p"${ZIP_PASSWORD}" \
+            -mhe=on \
+            -mx=3 \
+            -v85m \
+            "${ARCHIVE_NAME_PREFIX}.7z" \
+            "${ORIGINAL_FILE}"
+
+      - name: Remove original downloaded file
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_FILE="${{ steps.prepare_archive.outputs.original_file }}"
+
+          if [[ -n "${ORIGINAL_FILE}" && -f "${ORIGINAL_FILE}" ]]; then
+            rm -v "${ORIGINAL_FILE}"
+          fi
+
+          rm -rf downloads
+          rm -f yt-dlp-output.txt
+
+      - name: Configure Git
+        run: |
+          set -euo pipefail
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+      - name: Commit and push archive chunks
+        run: |
+          set -euo pipefail
+
+          FINAL_ARCHIVE_PREFIX="${{ steps.prepare_archive.outputs.archive_base_name }}_${{ steps.timestamp.outputs.value }}"
+
+          echo "Adding archive files matching:"
+          echo "${FINAL_ARCHIVE_PREFIX}.7z"
+          echo "${FINAL_ARCHIVE_PREFIX}.7z.*"
+
+          git add "${FINAL_ARCHIVE_PREFIX}.7z" 2>/dev/null || true
+          git add "${FINAL_ARCHIVE_PREFIX}.7z."* 2>/dev/null || true
+
+          if ! git diff --staged --quiet; then
+            git commit -m "Add YouTube 480p archive chunks: ${FINAL_ARCHIVE_PREFIX}"
+
+            push_success=false
+            max_attempts=15
+
+            for attempt in $(seq 1 "${max_attempts}"); do
+              echo "Push attempt ${attempt}/${max_attempts}..."
+
+              if git push origin HEAD; then
+                echo "Push successful."
+                push_success=true
+                break
+              fi
+
+              echo "Push failed. Fetching and retrying..."
+              sleep 20
+              git fetch origin
+            done
+
+            if [[ "${push_success}" == "false" ]]; then
+              echo "Normal push failed after multiple attempts. Trying force-with-lease..."
+
+              if git push origin HEAD --force-with-lease; then
+                echo "Force push successful."
+              else
+                echo "Force push failed."
+                exit 1
+              fi
+            fi
+          else
+            echo "No archive chunks found to commit."
+          fi
